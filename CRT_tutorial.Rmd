@@ -1,0 +1,596 @@
+---
+title: "Single-cell RNA-seq analysis tutorial"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    highlight: zenburn
+    theme: simplex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{css, echo=FALSE}
+.list-group-item.active, .list-group-item.active:hover, .list-group-item.active:focus {
+    color: #ffffff;
+    background-color: #333333;
+}
+p {
+  color: #333333;
+}
+```
+
+## Introduction 
+
+This tutorial will cover the basic steps in analysing scRNA-seq data. The dataset comes from [this paper](https://www.sciencedirect.com/science/article/pii/S0092867418307232) which described the immune microenvironment of breast cancer tumours by performing droplet-based scRNA-seq of CD45+ cells from breast cancer patients. For the purpose of this tutorial, we'll just be working on a subset of the full dataset to ensure there is enough time to run everything. We'll be using the Seurat R package to run most of the analysis, which is the most commonly used tool for analysing scRNA-seq data. Run the code chunks below to read in the data and get started.
+
+![](https://ars.els-cdn.com/content/image/1-s2.0-S0092867418307232-fx1.jpg)
+
+## Load data
+
+```{r, load_libraries, message=FALSE, warning=FALSE}
+# load libraries
+library(tidyverse)
+library(Seurat)
+library(clustree)
+library(ggsignif)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(patchwork)
+```
+
+```{r, read_data, cache=TRUE}
+# read in data
+dat <- readRDS('data/breast_cancer_scRNA.Rds')
+dat
+```
+The data is stored as a Seurat object, with 14,875 genes and 9,671 cells. We can find more information about each of the cells in the `meta.data` attribute of the Seurat object.
+
+```{r, meta}
+head(dat@meta.data)
+```
+
+We can also access metadata columns using the `$` operator.
+
+```{r, tables}
+table(dat$sample)
+table(dat$patient, dat$tissue)
+```
+The cells come from 19 different samples from 3 different patients. For each patient, there are at least 2 replicates taken from both tumour and normal tissue. 
+
+The actual gene expression values are stored in the `assays` attribute of the Seurat object.
+
+```{r, assays, warning=FALSE}
+dat@assays$RNA[1:10, 1:10]
+```
+The data is currently in the form of counts i.e. number of transcripts mapping to each gene that were detected in each cell. 
+
+## Quality control metrics
+
+To ensure poor quality cells are excluded from analysis, some filtering steps are commmonly performed. Cells are usually filtered on the basis of 3 quality control metrics: 
+
+- `nCount_RNA` - This is the total number of UMIs which were detected in a cell. Cells with unusually high counts could represent doublets (where more than one cell gets caught in a droplet and tagged with the same barcode) and cells with unusually low counts could represent empty droplets (where ambient RNA from cells that have lysed in the cell suspension gets caught in a droplet and tagged with a barcode).
+
+- `nFeature_RNA` - This is the total number of genes for which transcripts were detected in each cell. Similar to counts - cells with high genes could be doublets and cells with low genes could be empty droplets. Usually, `nCount_RNA` and `nFeature_RNA` are combined into one filter e.g. remove cells with counts <= 500 & genes <= 200.
+
+- `percent_mt` - This value represents the percentage of counts in a cell that map to the mitochondrial genome. Cells with high mitochondrial gene percentage can represent stressed or dying cells, where the cell has lysed prior to droplet generation and most of the nuclear mRNA has leaked out but the mitochondrial mRNA will still be present inside the mitochondria.
+
+
+Samples are typically QC-ed one by one and filters are decided for each sample by examining the distribution of the QC metrics above to decide on reasonable thresholds.
+
+This dataset has already been QC-ed so no cells should need to be removed but we can still look at the distribution of the QC metrics.
+
+```{r, qc_plots1, fig.width = 9, fig.height = 4}
+# first calculate the mitchondrial percentage for each cell
+dat$percent_mt <- PercentageFeatureSet(dat, pattern="^MT.")
+# make QC plots
+VlnPlot(dat, features = c("nCount_RNA", "nFeature_RNA", "percent_mt")) 
+```
+
+From these violin plots we can see that there doesn't appear to be much outliers for each of the metrics and we can see that cells have clearly already been filtered on the basis of `nCount_RNA` and `nFeature_RNA` - there are no cells with less than 100 counts and no cells with less than 75 genes. These filters become more obvious if you view the distribution of metrics in each sample individually.
+
+```{r, qc_plots2, fig.width = 9, fig.height = 4}
+VlnPlot(dat, features = c("nCount_RNA", "nFeature_RNA", "percent_mt"), group.by = 'sample')
+```
+
+
+```{r, qc_plots3, fig.height=9, fig.width = 9}
+ggplot(dat@meta.data, aes(x = nCount_RNA, y = nFeature_RNA, col = percent_mt)) +
+  geom_point(size = 0.8) +
+  scale_colour_viridis_c(option = 'F') + 
+  lims(x = c(0, NA), y = c(0, NA)) +
+  facet_wrap(~sample, nrow = 5, scales = 'free') +
+  theme_minimal()
+```
+
+All these samples appear to contain good quality cells and no further filtering is necessary.
+
+## Normalisation
+
+After removing unwanted cells from the dataset, the next step is to normalise the data. By default, Seurat uses a global-scaling normalisation method “LogNormalize” that normalises the gene expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result. 
+
+```{r, normalisation1}
+dat <- NormalizeData(dat)
+```
+
+The normalised data and the raw counts are both stored in Seurat object but by default, Seurat will use the normalised values for any downstream analysis.
+
+```{r, normalisation2}
+# view normalised data
+dat[["RNA"]]@data[1:10, 1:10]
+# view count data
+dat[["RNA"]]@counts[1:10, 1:10]
+```
+
+## Feature Selection
+
+In order to extract meaningful biological signals from the dataset, Seurat aims to identify a subset of features (e.g. genes) exhibiting high variability across cells, and therefore represent heterogeneous features to prioritise for downstream analysis. Choosing genes solely based on their log-normalised single-cell variance fails to account for the mean-variance relationship that is inherent to single-cell RNA-seq. Therefore, a variance-stabilising transformation is applied to correct for this before calculating the mean-variance relationship, implemented in the `FindVariableFeatures()` function.
+
+```{r, hvg_selection}
+# find the 4000 most variable genes
+dat <- FindVariableFeatures(dat, selection.method = "vst", nfeatures = 4000)
+head(VariableFeatures(dat), 20)
+```
+
+The most variable genes in the dataset are usually genes that are markers for a specific type of cell. For example, S100A8 and S100A9 (2 of the most variable genes) are markers for monocytes.
+
+## Data Scaling
+
+Prior to performing dimensionality reduction techniques such as PCA, the dataset is centered and scaled. What this process does is: 
+
+- Shift the expression of each gene, so that the mean expression across cells is 0.
+
+- Scale the expression of each gene, so that the variance across cells is 1.
+
+This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate. After performing scaling, the results are stored in `dat[["RNA"]]@scale.data`.
+
+```{r, scaling}
+# scale all genes, not just HVGs
+all.genes <- rownames(dat)
+dat <- ScaleData(dat, features = all.genes)
+dat[["RNA"]]@scale.data[1:10, 1:10]
+```
+
+## Dimensionality reduction
+
+The next task is to visualise the dataset. To do this we need to reduce the dimensionality of the data, as there's no way we can visualise ~14,000 dimensions. PCA is typically used first to reduce the data to around 15 dimensions and then more complex algorithms such as tSNE or UMAP can be used to reduce to 2 dimensions and visualise the data.
+
+
+### PCA
+
+PCA will be performed on the highly variable genes.
+
+```{r, pca1, cache=TRUE}
+# this will take a few minutes to run
+dat <- RunPCA(dat, features = VariableFeatures(object = dat), verbose = F)
+```
+
+We can check which genes contribute to each of the principal components.
+
+```{r, pca2}
+print(dat[["pca"]], dims = 1:2, nfeatures = 5)
+```
+
+We can also visualise the principal components as scatter plots.
+
+
+```{r, pca3}
+DimPlot(dat, reduction = "pca", dim = 1:2)
+DimPlot(dat, reduction = "pca", dim = 2:3)
+```
+
+The reason PCA is performed is to compress the dataset into a robust representation of the heterogeneity present in the dataset for downstream clustering, however now we are faced with an issue: how many PCs to include for downstream analyses? 
+
+The easiest (and quickest) way to decide this is with an elbow plot - a ranking of principle components based on the percentage of variance explained by each PC. 
+
+```{r, pca4}
+ElbowPlot(dat)
+```
+
+From this plot we might conclude that taking the top 10 PCs makes the most sense as not much more variance is explained by including any PCs after 10.
+
+### UMAP
+
+Both UMAP and tSNE are forms of graph-based clustering. The first step in this process is to construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the `FindNeighbors()` function, and takes as input the previously defined dimensionality of the dataset (we will include the top 10 PCs here).
+
+```{r, UMAP1, cache=TRUE}
+# construct knn graph
+dat <- FindNeighbors(dat, dims = 1:10)
+```
+
+This graph can now be used as input for the `RunUMAP()` function.
+The goal of this algorithm is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. 
+
+
+```{r, UMAP2, cache=TRUE}
+dat <- RunUMAP(dat, dims = 1:10)
+DimPlot(dat, reduction = 'umap')
+```
+
+We can layer metadata on top of this plot to see what is driving the clustering of the cells on the graph.
+
+```{r, UMAP3, fig.width=9, fig.height=6}
+DimPlot(dat, reduction = 'umap', group.by = c('sample', 'patient', 'tissue', 'cell_type_major'), ncol = 2)
+```
+
+From the plots above we can see that cells are mostly clustering by cell type but there is still a bit of separation between cells from different patients. Batch effects like this are really common with single-cell data and plenty of tools have been developed to overcome them.
+
+## Batch integration
+
+Seurat has its own method for integrating cells from different datasets/batches which uses canonical correlation analysis (CCA) to identify 'anchors' between the datasets, which are then used to align them. 
+
+So far we've been treating the dataset as a single batch. To perform batch effect correction on the dataset we need to split the Seurat object into a list of Seurat objects - one for each patient - and process them individually. 
+
+```{r, batch_integration1, cache=TRUE}
+# split the dataset into a list of seurat objects (one for each patient)
+dat@assays$RNA@data <- dat@assays$RNA@counts # restore counts
+patient.list <- SplitObject(dat, split.by = "patient")
+
+# normalise and identify variable features for each batch independently
+patient.list <- lapply(X = patient.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 4000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = patient.list, verbose = F)
+```
+
+We can now use the `FindIntegrationAnchors()` function to identify features that are highly correlated across batches ('anchors'). This step may take a few minutes to run.
+
+```{r, batch_integration2, cache=TRUE}
+anchors <- FindIntegrationAnchors(object.list = patient.list, anchor.features = features, verbose = F)
+```
+
+The anchors are then used as input to the `IntegrateData()` function to create a new Seurat object with an 'integrated' assay, which contains the batch corrected values.
+
+```{r, batch_integration3, cache=TRUE}
+dat.combined <- IntegrateData(anchorset = anchors) # create integrated seurat object
+DefaultAssay(dat.combined) <- 'integrated' # set default assay to 'integrated' - the uncorrected values are still present in 'RNA'
+dat.combined@assays$integrated@data[1:4, 1:4]
+```
+
+You'll notice the corrected assay contains negative values. These values should not be treated as traditional gene expression values and should not be used for things like differential expression analysis but can be used for constructing an integrated graph.
+
+We can now run the same steps as above on the integrated assay to generate visualisations where the batch effect should be less obvious.
+
+
+```{r, batch_integration4, cache=TRUE, fig.width=9, fig.height=6}
+# Run the standard workflow for visualisation and clustering
+dat.combined <- ScaleData(dat.combined, verbose = FALSE)
+dat.combined <- RunPCA(dat.combined, npcs = 10, verbose = FALSE)
+dat.combined <- FindNeighbors(dat.combined, dims = 1:10)
+dat.combined <- RunUMAP(dat.combined, dims = 1:10)
+
+
+# Visualisation
+DimPlot(dat.combined, reduction = 'umap', group.by = c('sample', 'patient', 'tissue', 'cell_type_major'), ncol = 2)
+```
+
+
+Because the batch effect was pretty minor to begin with, the plots above look fairly similar to the uncorrected ones but there is slightly more mixing between patients and there is now a separate cluster for the mast cells.
+
+## Clustering
+
+A common step in single-cell analysis is to run a community detection algorithm (such as Louvain or Leiden) to label similar cells as being part of the same cluster. We can do this in Seurat using the `FindClusters()` function which implements the Louvain algorithm by default. The clusters are detected from the KNN graph which we built above using the `FindNeighbors()` function. The `FindClusters()` function contains a resolution parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. The cluster labels will be stored in the `meta.data` attribute of the Seurat object.
+
+```{r, clustering1, fig.width=9, fig.height=8}
+# identify clusters using multiple different resolution values
+dat.combined <- FindClusters(dat.combined, resolution = seq(0.2, 1.2, 0.2)) 
+
+# visualise
+DimPlot(dat.combined, reduction = 'umap', group.by = c('integrated_snn_res.0.2', 'integrated_snn_res.0.4', 'integrated_snn_res.0.6', 'integrated_snn_res.0.8', 'integrated_snn_res.1', 'integrated_snn_res.1.2'), label = T, repel = T, ncol = 2)
+```
+
+As the resolution parameter increases, so does the number of clusters identified. Deciding on the optimal number of clusters to use is an unsolved question as it's impossible to know what the ground truth is but plenty of tools have been developed that provide heuristics to help make the decision. One of these tools is `clustree` which works quite nicely with Seurat objects.
+
+```{r, clustering2, fig.width=7, fig.height=9}
+clustree(dat.combined, prefix = "integrated_snn_res.")
+```
+
+
+This clustering tree visualises the relationships between clusters at a range of resolutions by looking at how cells move as the clustering resolution is increased. Each cluster forms a node in the tree and edges are constructed by considering the cells in a cluster at a lower resolution that end up in a cluster at the next highest resolution. By connecting clusters in this way we can see how clusters are related to each other, which are clearly distinct and which are unstable.
+
+We can see that some clusters are very distinct and do not change with the value of the resolution parameter. On the other side of the tree we see the tree becomes messier and there are nodes with multiple incoming edges as the resolution parameter is increased. This is a good indication that we have over clustered the data. The optimal resolution for clustering this dataset is probably around 0.2. 
+
+Given that we already have cell type labels for this dataset, we can also look at how the cluster labels overlap with the cell type labels to get an idea of the best value for the resolution parameter.
+
+```{r, clustering3, fig.width=9}
+plot_df <- dat.combined@meta.data %>% pivot_longer(cols = starts_with('integrated_snn_res.'), names_to = 'res')
+ggplot(plot_df, aes(x = value, fill = cell_type_major)) +
+  geom_bar(position = 'fill') +
+  scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+  facet_wrap(~res, scales = 'free') +
+  theme_minimal()
+```
+
+We can see that the resolution 0.2 clusters overlap best with the cell type labels. 
+
+## Cell type labelling
+
+This dataset already contains cell type labels but this is obviously not the case if you're conducting a single-cell analysis from scratch. There are multiple approaches out there for labelling cells but most of them fall into one of the following two categories:
+
+1. Looking at expression of known marker genes in different clusters and labelling cells accordingly.
+
+2. Comparing your dataset to a reference dataset from the same tissue and predicting cell type labels based on the reference.
+
+In this case, the authors used a combination of these two approaches. They first clustered cells using an algorithm that they developed in a previous study (Phenograph/Biscuit) and then compared the expression profiles of these clusters to several previously published bulk-sequencing datasets of sorted immune populations. The highest-scoring bulk profile for each cluster was used as a label for that cluster. The plot below shows the original cluster label for each cell and the corresponding cell type annotation for each cluster.
+
+
+```{r, cell_labelling1, fig.width=9}
+p1 <- DimPlot(dat.combined, reduction = 'umap', group.by = 'cluster', label = T, repel = T) + NoLegend()
+p2 <- DimPlot(dat.combined, reduction = 'umap', group.by = 'cell_type_minor', label = T, repel = T) + NoLegend()
+p1 + p2
+```
+
+
+To confirm these cell type labels the authors then checked that each cluster was expressing the correct marker genes for its given cell type label.
+
+The marker genes they used are shown in the following table:
+
+| Cell type | Marker genes |
+|-----------|--------------|
+| NK-cells | NCAM1, NCR1, NKG2 (KLRK1) |
+| cytotoxic T, NK | GNLY, PFN1, GZMA, GZMB, GZMM, GZMH |
+| Exhausted T cell, T-regulatory Cell | FOXP3, CTLA4, TIGIT, TNFRSF4, LAG3, PDCD1 |
+| T cells | CD8 (CD8A), CD3 (CD3E), CD4 |
+| Naive T cells | IL7R |
+| B cells | CD19 |
+| Mast cells | ENPP3, KIT |
+| plasmacytoid DC | IL3RA, LILRA4 |
+| Monocytic Lineage | HLA-DR (HLA-DRA), FCGR3A, CD68, ANPEP, ITGAX, CD14, ITGAM, CD33 |
+
+
+```{r, cell_labelling2, fig.width=10, fig.height=5}
+markers <- list(`NK cells` = c('NCAM1', 'NCR1', 'KLRK1'),
+                `Cytotoxic T/\nNK cells` = c('GNLY', 'PFN1', 'GZMA', 'GZMB', 'GZMM', 'GZMH'),
+                `Exhausted T/\nTregs` = c('FOXP3', 'CTLA4', 'TIGIT', 'TNFRSF4', 'LAG3', 'PDCD1'),
+                `T cells`  = c('CD8A', 'CD3E', 'CD4'),
+                `Naive\nT cells` = c('IL7R'),
+                `B\ncells` = c('CD19'),
+                `Mast\ncells` = c('ENPP3', 'KIT'),
+                `pDC` = c('IL3RA', 'LILRA4'),
+                `Monocytic\nlineage` = c('HLA.DRA', 'FCGR3A', 'CD68', 'ANPEP', 'ITGAX', 'CD14', 'ITGAM', 'CD33'))
+DotPlot(dat.combined, features = markers, group.by = 'cell_type_minor', assay = 'RNA') +
+  scale_colour_viridis_c(option = 'H') +
+  theme(axis.text = element_text(size = 8),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        axis.title = element_blank(),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8),
+        legend.position = 'bottom',
+        strip.text = element_text(size = 7)) +
+  coord_cartesian(clip = 'off')
+```
+
+
+The dotplot above shows that all cell types are expressing the genes you would expect them to which would indicate that the cells are well-labelled and we can move on to downstream analysis using these labels.
+
+## Cell type proportions
+
+To investigate how the immune micro-environment is altered in breast cancer we can compare the cell type composition in normal and tumour tissue. We use proportions rather than absolute number of cells as the number of cells captured for each sample will vary hugely due to technical factors.
+
+```{r, cell_type_prop1, fig.height=7, fig.width=9}
+# calculate percentages for each cell type in each sample
+plot_df <- dat.combined@meta.data %>% 
+  dplyr::select(sample, tissue, cell_type_minor) %>% 
+  group_by(sample, tissue, cell_type_minor) %>% 
+  tally() %>% ungroup() %>% group_by(sample) %>% 
+  mutate(per = n/sum(n))
+
+# plot results
+ggplot(plot_df, aes(x = tissue, y = per, fill = tissue)) +
+  geom_boxplot(outlier.alpha = 0, col = 'black') +
+  geom_jitter() +
+  geom_signif(comparisons = list(c("TUMOR", "NORMAL")), 
+              margin_top = 0.01) + # performs wilcoxon test to generate p values
+  geom_point(aes(y = per * 1.1), alpha = 0) +
+  scale_y_continuous(labels = function(x) scales::percent(x, accuracy = 0.1)) +
+  scale_fill_manual(values = c(NORMAL = '#FFB901', TUMOR = '#6966CD'), name = 'Tissue') +
+  labs(x = NULL, y = 'Percentage of all cells', title = 'Changes in cell type proportions') +
+  facet_wrap(~cell_type_minor, scales = 'free', nrow = 5) +
+  coord_cartesian(clip = 'off') +
+  theme_minimal(base_size = 12) +
+  theme(axis.text = element_text(colour = 'black'),
+        strip.text = element_text(margin = margin(b = 10), colour = 'black'),
+        axis.ticks = element_line(colour = 'gray20'),
+        legend.position = 'bottom',
+        plot.title = element_text(hjust = 0.5))
+```
+
+This plot shows us that B and Mast cells are significantly enriched in tumour samples while CD56+16+3+ NKT cells are significantly depleted.
+
+## Differential expression analysis
+
+We can also look at differential expression of genes to see which cell types are altered in the tumour micro-environment. The `FindMarkers()` function in Seurat can be used to identify DEGs between conditions for each cell type. This function implements a wilcoxon test by default.
+
+```{r, DEG, cache=TRUE}
+# for each cell type, get list of DEGs between normal and tumour tissue
+deg_df <- data.frame()
+for(i in unique(dat.combined$cell_type_minor)){
+  sub <- dat.combined[, dat.combined$cell_type_minor == i]
+  tryCatch({
+    degs <- FindMarkers(sub, assay = 'RNA', group.by = 'tissue', ident.1 = 'TUMOR', ident.2 = 'NORMAL', features = features)
+    degs <- degs %>% rownames_to_column(var = 'gene') %>% mutate(cell = i)
+    deg_df <- rbind(deg_df, degs)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+
+# make volcano plots of results
+ggplot(deg_df, aes(x = avg_log2FC, y = -log10(p_val_adj), col = p_val_adj <= 0.05)) +
+  geom_point(show.legend = F, size = 0.5) +
+  scale_shape_manual(values = c(20,19)) +
+  scale_color_manual(values = c('#FFC46B', '#FF7F37')) +
+  theme_minimal() +
+  theme(strip.background = element_rect(colour = 'black')) +
+  facet_wrap(~cell, nrow = 4)
+```
+
+From this plot it looks like the monocyte precursor cells show the most significant change in gene expression between tumour and normal samples. We can use the ClusterProfiler R package to try and figure out what biological processes these genes might be involved in.
+
+```{r, go_enrichment, cache=TRUE}
+all_genes <- names(rowSums(dat.combined@assays$RNA@counts)[rowSums(dat.combined@assays$RNA@counts) > 0])
+
+mono_genes <- deg_df %>% filter(cell == 'MONOCYTE:precursor', abs(avg_log2FC) >= 0.25, p_val_adj <= 0.05) %>% pull(gene)
+
+go_mono <- enrichGO(gene = mono_genes, universe = all_genes, OrgDb = org.Hs.eg.db, keyType = 'SYMBOL', ont = "BP")
+
+ggplot(data.frame(go_mono) %>% filter(qvalue <= 0.05) %>% slice_min(order_by = qvalue, n = 10) %>% mutate(Description = fct_rev(fct_inorder(Description))), aes(y = Description, x = -log10(qvalue), col = Count)) +
+  geom_point(size = 3) +
+  scale_colour_distiller(palette = 'PuRd', limits = c(0,12), direction = 1) +
+  labs(title = 'GO terms enriched among genes differentially expressed by monocytes\nin tumour tissue') +
+  theme_minimal() +
+  theme(plot.title.position = 'plot',
+        plot.title = element_text(hjust = 0.5))
+```
+
+This plot tells us that genes differentially expressed by monocytes in tumour tissue are associated with the humoral immune response and complement activation in particular. This suggests that the complement pathway may be dysregulated in tumour tissue.
+
+## Summary
+
+There are many other kinds of downstream analysis (such as pseudotime analysis, predicting cell-cell communication networks etc.) that could be performed on this dataset, and if you read the paper you'll see that the authors generated much more results than we have here. But from our limited analysis here, we can get a good overview of the composition of the immune microenvironment of breast cancer tumours and how this environment may be altered in comparison to normal tissue. Below is some code to generate a multi-panel figure summarising our results.
+
+
+```{r, summary_plots, fig.width = 12, fig.height=13, message=FALSE, warning=FALSE}
+# define colours for cell types
+celltype_cols <- c(`T:CD4+NAIVE` = "#98D0D0", `T:CD8+NAIVE` = "#79BEC8", `T:CD4+CM` = "#57ABBD", `T:CD4+EM` = "#3C97B3", `T:CD8+CM` = "#3481A4", `T:CD8+EM` = "#306D94", `T:Reg` = "#2C5985",
+                   `NKT` = "#3D1778", `NK:CD56+16+3+NKT` = "#553695", `NK:CD56+16+3-` = "#6B56A7", `NK:CD56-16+3-` = "#8273B5",
+                   `B:` = "#3A7219",
+                   `MAST:` = "#AD343E",
+                   `pDC:` = "#BD0000", `mDC:` = "#6D2F05",
+                   `MONOCYTE:` = "#B84F09", `MONOCYTE:precursor` = "#FC5E03",
+                   `MACROPHAGE:` = "#F7A660",
+                   `NEUTROPHIL:` = "#F7D760")
+
+# get df with umap embeddings & metadata
+umap_df <- cbind(Embeddings(dat.combined, reduction = 'umap'), dat.combined@meta.data) %>% mutate(cell_type_minor = factor(cell_type_minor, levels = names(celltype_cols)))
+
+# plot showing composition of dataset
+pat <- umap_df %>% group_by(value = patient) %>% tally() %>% mutate(var = 'Patient')
+tis <- umap_df %>% group_by(value = tissue) %>% tally() %>% mutate(var = 'Tissue')
+plot_df <- rbind(pat, tis)
+
+comp_plot <- ggplot(plot_df, aes(x = var, y = n, fill = value, col = value)) +
+  geom_col() +
+  scale_fill_manual(name = 'Patient', values = c(BC1 = '#FD636B', BC2 = '#19AFD0', BC3 = '#3BEB80', NORMAL = '#FFB901', TUMOR = '#6966CD'), breaks = c('BC1', 'BC2', 'BC3')) +
+  scale_colour_manual(name = 'Tissue', values = c(BC1 = '#FD636B', BC2 = '#19AFD0', BC3 = '#3BEB80', NORMAL = '#FFB901', TUMOR = '#6966CD'), breaks = c('NORMAL', 'TUMOR')) +
+  scale_y_continuous(expand = c(0,0), breaks = c(seq(0, 7500, 2500), nrow(umap_df)), name = '# of cells', labels = function(x) prettyNum(x, big.mark = ',')) +
+  guides(colour = guide_legend(override.aes = list(fill = c(NORMAL = '#FFB901', TUMOR = '#6966CD')))) +
+  theme_classic(base_size = 12) +
+  theme(axis.text = element_text(colour = 'black'),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size = 11),
+        plot.margin = margin(t = 10))
+
+# umap plot coloured by cell type
+umap_plot <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, col = cell_type_minor)) +
+  geom_point(show.legend = F, size = 0.6) +
+  geom_label_repel(data = umap_df %>% # label major celltype populations
+                     group_by(cell_type_major) %>%
+                     summarise(x = median(UMAP_1),
+                               y = median(UMAP_2)),
+                   aes(x = x,
+                       y = y,
+                       label = cell_type_major, col = NULL), 
+                   show.legend = F,
+                   label.size = NA,
+                   label.padding = unit(0.1, "lines"),
+                   fill = alpha(c("white"),0.8),
+                   size = 4, segment.colour = NA) +
+  scale_colour_manual(values = celltype_cols, name = NULL) +
+  theme_void(base_size = 12) 
+
+# plot of cell type composition of normal/tumour tissue
+cell_comp_plot <- ggplot(umap_df, aes(x = 1, fill = cell_type_minor)) + 
+  geom_bar(position = 'fill', show.legend = T) +
+  scale_fill_manual(values = celltype_cols, name = NULL) + 
+  scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+  facet_wrap(~tissue, strip.position = 'bottom') +
+  guides(fill = guide_legend(ncol = 4, override.aes = list(size = 0.05))) +
+  theme_minimal(base_size = 12) +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_text(colour = "black"),
+        legend.text = element_text(size = 12),
+        legend.position = 'bottom',
+        legend.box.margin = margin(r = 500),
+        legend.key.height = unit(0.5, 'lines'),
+        panel.grid = element_blank(),
+        strip.placement = 'outside',
+        axis.text.x = element_blank(),
+        axis.title = element_blank())
+
+# UMAP plots showing expression of marker genes
+markers <- c("CD3E", "NKG7",  "CD79A", "TPSAB1", "CST3")
+gene_exp <- data.frame(t(dat.combined[markers, ]@assays$RNA@data))
+gene_exp <- cbind(umap_df, gene_exp) %>% pivot_longer(markers, names_to = 'gene') %>% mutate(gene = fct_inorder(gene))
+
+gene_exp_plot <- ggplot(gene_exp, aes(x=UMAP_1, y = UMAP_2, col = value, shape = value > 0, alpha = value)) +
+  geom_point(size = 0.8, show.legend = F) +
+  scale_shape_manual(values = c(20, 19)) +
+  scale_color_viridis_c(option = 'D') +
+  scale_alpha(range = c(0.7, 1)) +
+  facet_wrap(~gene, nrow = 1) +
+  theme_void(base_size = 12)
+
+# plot of number of DEGs per cell type
+n_deg_plot <- ggplot(deg_df %>% filter(abs(avg_log2FC) >= 0.25, p_val_adj <= 0.05) %>%  mutate(cell = factor(cell, levels = rev(names(celltype_cols)))) %>% group_by(cell, .drop = F) %>% tally() , aes(x = 1, y = cell, fill = n)) +
+  geom_tile(col = 'gray20', show.legend = F) +
+  geom_text(aes(label = n, col = n > 20), show.legend = F) +
+  scale_fill_viridis(option = 'F', direction = -1) +
+  scale_colour_manual(values = c('black', 'white')) +
+  scale_x_discrete(expand = c(0,0), name  = "Number of DEGs") +
+  scale_y_discrete(expand = c(0,0), name = NULL) +
+  theme_linedraw(base_size = 12) 
+
+# plot of top DEGs for monocytes
+mono_degs <- c("COL1A1", "SLC40A1", "MGP", "FCN1", "S100A9", "S100A4")
+mono_exp <- data.frame(t(dat.combined[mono_degs, dat.combined$cell_type_minor == 'MONOCYTE:precursor']@assays$RNA@data))
+mono_exp <- cbind(umap_df[umap_df$cell_type_minor == 'MONOCYTE:precursor', ], mono_exp) %>% pivot_longer(mono_degs, names_to = 'gene') %>% mutate(gene = fct_inorder(gene), up_down = ifelse(gene %in% c("COL1A1", "SLC40A1", "MGP"), "Downregulated", "Upregulated"))
+
+mono_deg_plot <- ggplot(mono_exp, aes(x = tissue, y = value, fill = tissue)) +
+  geom_violin(show.legend = T, scale = 'width', position = position_dodge(width = 0.1)) +
+  geom_jitter(size = 0.1, alpha = 0.5, position = position_jitter(width = 0.1), show.legend = F) +
+  scale_fill_manual(values = c(NORMAL = '#FFB901', TUMOR = '#6966CD'), name = NULL) +
+  facet_grid(up_down~gene, switch = 'y', scales = 'free') +
+  theme_minimal(base_size = 12) +
+  theme(strip.placement = 'outside',
+        strip.background.y = element_rect(colour = 'black'),
+        axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.y = element_line(colour = 'gray20'),
+        legend.position = c(0.9, 0.8))
+
+# plot showing enriched GO terms for monocyte DEGs
+go_plot <- ggplot(data.frame(go_mono) %>% filter(qvalue <= 0.05) %>% slice_min(order_by = qvalue, n = 10) %>% mutate(Description = fct_rev(fct_inorder(Description))), aes(y = Description, x = -log10(qvalue), col = Count)) +
+  geom_point(size = 3) +
+  scale_colour_distiller(palette = 'PuRd', limits = c(0,12), direction = 1) +
+  labs(y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text = element_text(colour = 'black'),
+        legend.position = c(0.8, 0.35))
+
+# set up layout for summary plot
+layout <- "
+ABBBC
+ABBBC
+DDDDE
+DDDDE
+FFFFG
+FFFFG
+FFFFG
+"
+
+# combine all plots and add annotations
+comp_plot + umap_plot + cell_comp_plot + gene_exp_plot + n_deg_plot + mono_deg_plot + go_plot + plot_layout(design = layout) + plot_annotation(tag_levels = 'A', title = 'Single-cell analysis of immune cells in tumour and normal tissue from breast cancer patients', caption = str_wrap("\nPanel A shows the total number of cells in this dataset (9,671) and a breakdown of how many come from each patient/tissue. Panel B is a UMAP plot of the dataset, coloured by cell type, with the major cell populations labelled. Panel C shows the percentage of each cell type in normal and tumour tissues. Panel D is a series of UMAP plots showing the expression of marker genes for T (CD3E), NK (NKG7), B (CD79A), Mast (TPSAB1) and monocytic lineage (CST3) cells. Panel E shows the number of genes that were differentially expressed between tumour and normal samples for each cell type. Panel F shows the expression of the top 3 down- and up-regulated genes for monocytes in monocytes from normal and tumour samples. Panel G displays the top 10 GO terms that were enriched among genes differentially expressed by monocytes in tumour tissue.", width = 151)) &
+  theme(plot.title = element_text(size = 18, hjust = 0.5),
+        plot.caption = element_text(hjust = 0, size = 12))
+```
+
+
+PS. If you have any questions about any of the material covered here or if you ever want to chat about single-cell genomics, feel free to email me at s.ennis6@nuigalway.ie! 
+
+PPS. Thanks to Barry Digby who put together a previous version of this tutorial which I copied and pasted chunks from. 

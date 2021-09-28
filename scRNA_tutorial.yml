@@ -1,0 +1,16 @@
+name: scRNA_tutorial
+channels:
+ - conda-forge
+ - bioconda
+dependencies:
+ - r-essentials
+ - r-tidyverse
+ - r-Seurat
+ - r-clustree
+ - r-ggsignif
+ - bioconductor-clusterProfiler
+ - bioconductor-org.Hs.eg.db
+ - r-ggrepel
+ - r-patchwork
+ - r-rvcheck=0.1.8
+
