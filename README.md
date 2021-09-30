@@ -1,6 +1,8 @@
 ## Single-cell RNA-seq analysis workshop
 
-This repository contains all the material needed for the scRNA-seq data analysis tutorial. Before the tutorial, run the following commands from the terminal to download all the necessary data and set up a conda environment with all the R packages we'll be using.
+This repository contains all the material needed for the scRNA-seq data analysis tutorial. Download the repository either by clicking the green 'Code' button above or by cloning it  from the command line using `git clone https://github.com/Sarah145/CRT_tutorial`.  
+
+**If you're running Ubuntu** and have conda installed you can use the .yml file to create a conda environment which should have all the necessary packages installed. 
 
 1. Clone this repository and navigate into it
 
@@ -31,3 +33,14 @@ This repository contains all the material needed for the scRNA-seq data analysis
    ```
 
    
+
+**If you're running Windows**, I have no idea whether the conda approach will work but if you just open Rstudio and install the following R packages, hopefully everything will run smoothly!
+
+- tidyverse (CRAN)
+- Seurat (CRAN)
+- clustree (CRAN)
+- ggsignif (CRAN)
+- clusterProfiler (Bioconductor)
+- org.Hs.eg.db (Bioconductor)
+- ggrepel (CRAN)
+- patchwork (CRAN)
